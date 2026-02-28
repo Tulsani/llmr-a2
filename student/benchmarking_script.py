@@ -4,6 +4,7 @@ from a1_basics.optimizer import AdamW
 import torch
 import argparse
 import timeit
+from a1_basics.nn_utils import cross_entropy
 
 
 #### definine models for sweeps ###
@@ -37,9 +38,9 @@ def parser_args():
     parser.add_argument("--vocab_size",     type=int, default=10000)
 
     #benchmarking
-    parser.add_argument("--mode", choices=["forward", "forward_backward", "full"],
+    parser.add_argument("--mode", choices=["forward", "forward_backward"],
                         default="forward")
-    parser.add_argument("--warmup_steps", type=int, default=5)
+    parser.add_argument("--warmup_steps", type=int)
     parser.add_argument("--n_steps",      type=int, default=10)
 
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -72,74 +73,79 @@ def build_model(args):
 
 # gnerate random batch
 def random_batch(args):
-    return torch.randint(
+    x = torch.randint(
         0,
         args.vocab_size,
         (args.batch_size,args.context_length),
         device=args.device
     )
-
-
+    y = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length), device=args.device)
+    return x,y
 
 
 
 # getting this from examples
-def mean(values: list[float]) -> float:
+def mean_fn(values: list[float]) -> float:
     return sum(values) / len(values)
 
-@torch.no_grad()
-def _forward_only(model, x):
-    return model(x)
 
-def benchmark(
-    model,
-    x,
-    y,
-    optimizer,
-    loss_fn,
-    warmup_steps=10,
-    steps=50,
-    mode="forward",  # "forward" or "forward_backward"
-):
-    device = next(model.parameters()).device
-    model.train()
-
-    for _ in range(warmup_steps):
-        if mode == "forward":
-            _ = _forward_only(model, x)
-        elif mode == "forward_backward":
-            optimizer.zero_grad(set_to_none=True)
+def forward_backward_callable(model,x,y,args):
+    
+    #like example
+    if args.mode == "forward":
+        
+        @torch.no_grad()
+        def forward_pass():
             logits = model(x)
-            loss = loss_fn(logits, y)
-            loss.backward()
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
+            torch.cuda.synchronize()
 
-        if device.type == "cuda":
-            torch.cuda.synchronize()  # per spec: after each step
+        return forward_pass
+    
+    if args.mode == "forward_backward":
+
+        optimzer = AdamW(model.parameters(),lr=3e-4)
+
+        def full_pass():
+            #zero all grads
+            optimzer.zero_grad()
+
+            # forward pass
+            logits = model(x)
+            # loss
+            loss = cross_entropy(logits,y)
+            #
+            loss.backward()
+            # optimzer step
+            optimzer.step()
+
+            torch.cuda.synchronize()
+
+        return full_pass
+
+def benchmark(callable,warmup_steps=None,n_steps=None):
+    
+    if warmup_steps is not None: 
+        print("Warm up steps being used")
+        for _ in range(warmup_steps):
+            callable()
 
     times = []
-    for _ in range(steps):
-        if device.type == "cuda":
-            torch.cuda.synchronize()  # flush before timing
 
-        t0 = timeit.default_timer()
+    for _ in range(n_steps):
+        start_time = timeit.default_timer()
 
-        if mode == "forward":
-            _ = _forward_only(model, x)
-        else:  # forward_backward
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(x)
-            loss = loss_fn(logits, y)
-            loss.backward()
+        # call
+        callable()
 
-        if device.type == "cuda":
-            torch.cuda.synchronize() 
+        # end time
+        end_time = timeit.default_timer()
 
-        t1 = timeit.default_timer()
-        times.append(t1 - t0)
+        #times
+        times.append((end_time-start_time))
 
-    return mean(times), times
+    mean = mean_fn(times)
+
+    return mean
 
 
 
@@ -155,9 +161,20 @@ def main():
     print(f"  Parameters: {n_params:.1f}M\n")
 
     # genereate random data
-    x = random_batch(args)
+    x,y = random_batch(args)
+
+    # get callable
+    callable = forward_backward_callable(model,x,y,args)
 
     # lets start benchmarking
+    mean_s = benchmark(callable,args.warmup_steps,args.n_steps)
+    mean_ms = mean_s * 1000.0
+
+    # need to return this as table
+    print(f"\nResults  [{args.mode} | {args.size} | ctx={args.context_length}]")
+    print(f"  Mean : {mean_ms:8.2f} ms")
+
+
 
 
 if __name__ == "__main__":
