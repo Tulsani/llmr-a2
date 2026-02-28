@@ -143,7 +143,28 @@ def benchmark(
 
 
 
-        
+def main():
+    args = parser_args()
+
+    # build model
+    print(f"\nBuilding model")
+    model = build_model(args)
+    # count params
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    
+    print(f"  Parameters: {n_params:.1f}M\n")
+
+    # genereate random data
+    x = random_batch(args)
+
+    # lets start benchmarking
+
+
+if __name__ == "__main__":
+    main()
+
+
+
         
 
 
