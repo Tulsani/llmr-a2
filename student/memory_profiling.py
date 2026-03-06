@@ -60,8 +60,8 @@ def parse_args():
     parser.add_argument("--context_length", type=int, default=512)
     parser.add_argument("--batch_size",     type=int, default=4)
     parser.add_argument("--vocab_size",     type=int, default=10000)
-    parser.add_argument("--mode", choices=["forward", "forward_backward", "full"],
-                        default="forward_backward")
+    parser.add_argument("--mode", choices=["forward", "backward", "forward_backward", "full"],
+                        default="forward")
     parser.add_argument("--warmup_steps",   type=int, default=5)
     parser.add_argument("--n_steps",        type=int, default=10)
     parser.add_argument("--mixed_precision", action="store_true",
@@ -73,7 +73,6 @@ def parse_args():
                         help="Output path for memory snapshot (default: memory_snapshot.pickle)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
-
 
 
 def build_model(args):
@@ -119,7 +118,23 @@ def forward_backward_callable(model, x, y, args):
             torch.cuda.synchronize()
         return forward_pass
 
-    else:  # "full"
+    elif args.mode == "backward":
+        def backward_only():
+            with nvtx.range("forward_for_graph"):
+                with autocast_ctx:
+                    logits = model(x)
+            with nvtx.range("loss_for_graph"):
+                loss = cross_entropy(logits, y)
+
+
+            optimizer.zero_grad()
+
+            with nvtx.range("backward"):
+                loss.backward()
+            torch.cuda.synchronize()
+        return backward_only
+
+    else:  # "forward_backward" / "full"
         def full_pass():
             optimizer.zero_grad()
             with nvtx.range("forward"):
@@ -151,9 +166,7 @@ def benchmark(step_fn, warmup_steps, n_steps):
     return statistics.mean(times), statistics.stdev(times)
 
 
-
 def profile_memory(step_fn, warmup_steps, snapshot_file):
-  
     print(f"  Warming up for {warmup_steps} step(s)...", flush=True)
     for _ in range(warmup_steps):
         step_fn()
@@ -170,7 +183,6 @@ def profile_memory(step_fn, warmup_steps, snapshot_file):
     torch.cuda.memory._record_memory_history(enabled=None)
 
     print(f"  Snapshot saved to: {snapshot_file}")
-    
 
     # Also report peak memory as a quick sanity check
     peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
