@@ -162,10 +162,9 @@ def main():
     print("="*65)
     print(df.to_string(index=False))
 
-    
-    with open("attention_benchmark_results.md", "w") as f:
-        f.write(df.to_markdown(index=False))
-    print("\nSaved to attention_benchmark_results.md")
+    # Save as CSV for later tabulation (no tabulate dependency needed)
+    df.to_csv("attention_benchmark_results.csv", index=False)
+    print("\nSaved to attention_benchmark_results.csv")
 
 
 if __name__ == "__main__":
