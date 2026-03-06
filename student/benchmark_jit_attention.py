@@ -164,15 +164,10 @@ def main():
     print("="*90)
     print(df_pivot.to_string(index=False))
 
-    with open("attention_benchmark_results.md", "w") as f:
-        f.write("## Vanilla\n\n")
-        f.write(df[df.impl == "vanilla"].drop(columns="impl").to_markdown(index=False))
-        f.write("\n\n## Compiled\n\n")
-        f.write(df[df.impl == "compiled"].drop(columns="impl").to_markdown(index=False))
-        f.write("\n\n## Side-by-side\n\n")
-        f.write(df_pivot.to_markdown(index=False))
-
-    print("\nSaved to attention_benchmark_results.md")
+    # Save as CSV for later tabulation (no tabulate dependency needed)
+    df.to_csv("attention_compile_results_long.csv", index=False)
+    df_pivot.to_csv("attention_compile_results_pivot.csv", index=False)
+    print("\nSaved to attention_compile_results_long.csv and attention_compile_results_pivot.csv")
 
 
 if __name__ == "__main__":
