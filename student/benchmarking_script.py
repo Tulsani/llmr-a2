@@ -38,7 +38,7 @@ def parser_args():
     parser.add_argument("--vocab_size",     type=int, default=10000)
 
     #benchmarking
-    parser.add_argument("--mode", choices=["forward", "forward_backward"],
+    parser.add_argument("--mode", choices=["forward", "forward_backward", "backward"],
                         default="forward")
     parser.add_argument("--warmup_steps", type=int)
     parser.add_argument("--n_steps",      type=int, default=10)
@@ -89,7 +89,39 @@ def mean_fn(values: list[float]) -> float:
     return sum(values) / len(values)
 
 
-def forward_backward_callable(model,x,y,args):
+def forward_backward_callable(model, x, y, args):
+
+    if args.mode == "forward":
+        @torch.no_grad()
+        def forward_pass():
+            logits = model(x)
+            torch.cuda.synchronize()
+        return forward_pass
+
+    if args.mode == "backward":
+        # Run forward once outside timing to get a live computation graph
+        logits = model(x)
+        loss = cross_entropy(logits, y)
+
+        def backward_pass():
+            # Retain graph so we can call backward repeatedly across steps
+            loss.backward(retain_graph=True)
+            torch.cuda.synchronize()
+
+        return backward_pass
+
+    if args.mode == "forward_backward":
+        optimizer = AdamW(model.parameters(), lr=3e-4)
+
+        def full_pass():
+            optimizer.zero_grad()
+            logits = model(x)
+            loss = cross_entropy(logits, y)
+            loss.backward()
+            optimizer.step()
+            torch.cuda.synchronize()
+
+        return full_pass
     
     #like example
     if args.mode == "forward":
