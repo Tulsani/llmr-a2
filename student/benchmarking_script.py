@@ -4,6 +4,7 @@ from a1_basics.optimizer import AdamW
 import torch
 import argparse
 import timeit
+import statistics
 from a1_basics.nn_utils import cross_entropy
 
 
@@ -26,7 +27,7 @@ def parser_args():
     # select model
     parser.add_argument("--size", choices=list(MODEL_CONFIGS.keys()), default="small")
 
-    #manual override
+    # manual override
     parser.add_argument("--d_model",    type=int, default=None)
     parser.add_argument("--d_ff",       type=int, default=None)
     parser.add_argument("--num_layers", type=int, default=None)
@@ -49,16 +50,13 @@ def parser_args():
 
 
 def build_model(args):
-    #model condif
     model_config = dict(MODEL_CONFIGS[args.size])
 
-    # if over rides
-    for key in ("d_model","d_ff","num_layers","num_heads"):
-        val = getattr(args,key)
+    for key in ("d_model", "d_ff", "num_layers", "num_heads"):
+        val = getattr(args, key)
         if val is not None:
             model_config[key] = val
-    
-    #model
+
     model = BasicsTransformerLM(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
@@ -66,27 +64,19 @@ def build_model(args):
         **model_config
     )
 
-    # push model to device
     model.to(args.device)
-
     return model
 
-# gnerate random batch
+
 def random_batch(args):
     x = torch.randint(
         0,
         args.vocab_size,
-        (args.batch_size,args.context_length),
+        (args.batch_size, args.context_length),
         device=args.device
     )
     y = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length), device=args.device)
-    return x,y
-
-
-
-# getting this from examples
-def mean_fn(values: list[float]) -> float:
-    return sum(values) / len(values)
+    return x, y
 
 
 def forward_backward_callable(model, x, y, args):
@@ -122,42 +112,12 @@ def forward_backward_callable(model, x, y, args):
             torch.cuda.synchronize()
 
         return full_pass
-    
-    #like example
-    if args.mode == "forward":
-        
-        @torch.no_grad()
-        def forward_pass():
-            logits = model(x)
-            torch.cuda.synchronize()
 
-        return forward_pass
-    
-    if args.mode == "forward_backward":
 
-        optimzer = AdamW(model.parameters(),lr=3e-4)
+def benchmark(callable, warmup_steps=None, n_steps=None):
 
-        def full_pass():
-            #zero all grads
-            optimzer.zero_grad()
-
-            # forward pass
-            logits = model(x)
-            # loss
-            loss = cross_entropy(logits,y)
-            #
-            loss.backward()
-            # optimzer step
-            optimzer.step()
-
-            torch.cuda.synchronize()
-
-        return full_pass
-
-def benchmark(callable,warmup_steps=None,n_steps=None):
-    
-    if warmup_steps is not None: 
-        print("Warm up steps being used")
+    if warmup_steps is not None:
+        print(f"  Warming up for {warmup_steps} step(s)...")
         for _ in range(warmup_steps):
             callable()
 
@@ -165,57 +125,37 @@ def benchmark(callable,warmup_steps=None,n_steps=None):
 
     for _ in range(n_steps):
         start_time = timeit.default_timer()
-
-        # call
         callable()
-
-        # end time
         end_time = timeit.default_timer()
+        times.append(end_time - start_time)
 
-        #times
-        times.append((end_time-start_time))
+    mean = statistics.mean(times)
+    std  = statistics.stdev(times)  # sample std dev (n-1 denominator)
 
-    mean = mean_fn(times)
-
-    return mean
-
+    return mean, std
 
 
 def main():
     args = parser_args()
 
-    # build model
     print(f"\nBuilding model")
     model = build_model(args)
-    # count params
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    
+
     print(f"  Parameters: {n_params:.1f}M\n")
 
-    # genereate random data
-    x,y = random_batch(args)
+    x, y = random_batch(args)
 
-    # get callable
-    callable = forward_backward_callable(model,x,y,args)
+    callable = forward_backward_callable(model, x, y, args)
 
-    # lets start benchmarking
-    mean_s = benchmark(callable,args.warmup_steps,args.n_steps)
+    mean_s, std_s = benchmark(callable, args.warmup_steps, args.n_steps)
     mean_ms = mean_s * 1000.0
+    std_ms  = std_s  * 1000.0
 
-    # need to return this as table
     print(f"\nResults  [{args.mode} | {args.size} | ctx={args.context_length}]")
     print(f"  Mean : {mean_ms:8.2f} ms")
-
-
+    print(f"  Std  : {std_ms:8.2f} ms\n")
 
 
 if __name__ == "__main__":
     main()
-
-
-
-        
-
-
-
-
