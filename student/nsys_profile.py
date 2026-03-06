@@ -27,7 +27,7 @@ MODEL_CONFIGS = {
 ROPE_THETA = 10000
 
 
-# annoted attention
+# annotated attention
 @nvtx.range("scaled dot product attention")
 def annotated_scaled_dot_product_attention(Q, K, V, mask=None):
     d_k = K.shape[-1]
@@ -61,13 +61,12 @@ def parse_args():
     parser.add_argument("--context_length", type=int, default=512)
     parser.add_argument("--batch_size",     type=int, default=4)
     parser.add_argument("--vocab_size",     type=int, default=10000)
-    parser.add_argument("--mode", choices=["forward", "forward_backward", "full"],
-                        default="forward_backward")
+    parser.add_argument("--mode", choices=["forward", "backward", "forward_backward", "full"],
+                        default="forward")
     parser.add_argument("--warmup_steps",   type=int, default=5)
     parser.add_argument("--n_steps",        type=int, default=10)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
-
 
 
 def build_model(args):
@@ -94,7 +93,6 @@ def random_batch(args):
     return x, y
 
 
-
 def forward_backward_callable(model, x, y, args):
     optimizer = AdamW(model.parameters(), lr=3e-4)
 
@@ -104,11 +102,24 @@ def forward_backward_callable(model, x, y, args):
             with nvtx.range("forward"):
                 _ = model(x)
             torch.cuda.synchronize()
-        
+
         return forward_pass
 
+    elif args.mode == "backward":
+        def backward_only():
+            with nvtx.range("forward_for_graph"):
+                logits = model(x)
+            with nvtx.range("loss_for_graph"):
+                loss = cross_entropy(logits, y)
+            optimizer.zero_grad()
 
-    else:  # "full"
+            with nvtx.range("backward"):
+                loss.backward()
+            torch.cuda.synchronize()
+
+        return backward_only
+
+    else:  # "forward_backward" / "full"
         def full_pass():
             optimizer.zero_grad()
             with nvtx.range("forward"):
@@ -120,7 +131,6 @@ def forward_backward_callable(model, x, y, args):
             with nvtx.range("optimizer"):
                 optimizer.step()
             torch.cuda.synchronize()
-        
         return full_pass
 
 
@@ -136,7 +146,7 @@ def benchmark(step_fn, warmup_steps, n_steps):
             t0 = timeit.default_timer()
             step_fn()
             t1 = timeit.default_timer()
-        times.append((t1 - t0) * 1000)  
+        times.append((t1 - t0) * 1000)
 
     return statistics.mean(times), statistics.stdev(times)
 
@@ -144,12 +154,12 @@ def benchmark(step_fn, warmup_steps, n_steps):
 def main():
     args = parse_args()
 
-    # replacing scaled dot product
     a1_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
     model = build_model(args)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"  Parameters: {n_params:.1f}M")
+    print(f"  Mode      : {args.mode}")
 
     x, y = random_batch(args)
     callable = forward_backward_callable(model, x, y, args)
