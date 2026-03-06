@@ -169,19 +169,19 @@ def save_outputs(df):
     print("\nSaved: flash_benchmark_results.csv")
 
 
-    with open("flash_benchmark_results.md", "w") as f:
-        for dtype_name in df['dtype'].unique():
-            for d in sorted(df['d'].unique()):
-                subset = df[(df['dtype'] == dtype_name) & (df['d'] == d)][
-                    ['seq_len',
-                     'fwd_flash_ms', 'fwd_pt_ms', 'fwd_speedup',
-                     'bwd_flash_ms', 'bwd_pt_ms', 'bwd_speedup',
-                     'e2e_flash_ms', 'e2e_pt_ms', 'e2e_speedup']
-                ].set_index('seq_len')
-                f.write(f"\n### dtype={dtype_name}  d={d}\n\n")
-                f.write(subset.to_markdown())
-                f.write("\n")
-    print("Saved: flash_benchmark_results.md")
+    # with open("flash_benchmark_results.md", "w") as f:
+    #     for dtype_name in df['dtype'].unique():
+    #         for d in sorted(df['d'].unique()):
+    #             subset = df[(df['dtype'] == dtype_name) & (df['d'] == d)][
+    #                 ['seq_len',
+    #                  'fwd_flash_ms', 'fwd_pt_ms', 'fwd_speedup',
+    #                  'bwd_flash_ms', 'bwd_pt_ms', 'bwd_speedup',
+    #                  'e2e_flash_ms', 'e2e_pt_ms', 'e2e_speedup']
+    #             ].set_index('seq_len')
+    #             f.write(f"\n### dtype={dtype_name}  d={d}\n\n")
+    #             f.write(subset.to_markdown())
+    #             f.write("\n")
+    # print("Saved: flash_benchmark_results.md")
 
 
 

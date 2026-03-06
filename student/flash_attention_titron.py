@@ -3,7 +3,7 @@ import torch
 import triton
 import triton.language as tl
 from torch.autograd import Function
-
+from student.flash_attention_backward import flash_attention_backward
 
 @triton.jit
 def flash_fwd_kernel(
@@ -186,4 +186,9 @@ class FlashAttentionTriton(Function):
 
     @staticmethod
     def backward(ctx, dO):
-        raise NotImplementedError("Backward pass not yet implemented")
+        Q, K, V, O, L = ctx.saved_tensors
+        is_causal = ctx.is_causal
+
+        dQ, dK, dV = flash_attention_backward(Q, K, V, O, dO, L, is_causal=is_causal)
+
+        return dQ, dK, dV, None
