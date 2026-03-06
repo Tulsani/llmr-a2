@@ -27,7 +27,6 @@ MODEL_CONFIGS = {
 ROPE_THETA = 10000
 
 
-
 @nvtx.range("scaled dot product attention")
 def annotated_scaled_dot_product_attention(Q, K, V, mask=None):
     d_k = K.shape[-1]
@@ -61,8 +60,8 @@ def parse_args():
     parser.add_argument("--context_length", type=int, default=512)
     parser.add_argument("--batch_size",     type=int, default=4)
     parser.add_argument("--vocab_size",     type=int, default=10000)
-    parser.add_argument("--mode", choices=["forward", "forward_backward", "full"],
-                        default="forward_backward")
+    parser.add_argument("--mode", choices=["forward", "backward", "forward_backward", "full"],
+                        default="forward")
     parser.add_argument("--warmup_steps",   type=int, default=5)
     parser.add_argument("--n_steps",        type=int, default=10)
     # Mixed precision flag — off by default, matches FP32 baseline
@@ -70,7 +69,6 @@ def parse_args():
                         help="Enable BF16 autocast mixed precision")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
-
 
 
 def build_model(args):
@@ -107,7 +105,6 @@ def get_autocast_ctx(args):
     return nullcontext()
 
 
-
 def forward_backward_callable(model, x, y, args):
     optimizer = AdamW(model.parameters(), lr=3e-4)
     autocast_ctx = get_autocast_ctx(args)
@@ -122,7 +119,21 @@ def forward_backward_callable(model, x, y, args):
             torch.cuda.synchronize()
         return forward_pass
 
-    else:  # "full"
+    elif args.mode == "backward":
+        def backward_only():
+            with nvtx.range("forward_for_graph"):
+                with autocast_ctx:
+                    logits = model(x)
+            with nvtx.range("loss_for_graph"):
+                loss = cross_entropy(logits, y)
+            optimizer.zero_grad()
+
+            with nvtx.range("backward"):
+                loss.backward()
+            torch.cuda.synchronize()
+        return backward_only
+
+    else:  # "forward_backward" / "full"
         def full_pass():
             optimizer.zero_grad()
             with nvtx.range("forward"):
