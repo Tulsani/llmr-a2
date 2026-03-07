@@ -6,7 +6,7 @@ from triton import cdiv
 from torch.autograd import Function
 
 from student.flash_attention_backward import flash_attention_backward
-
+from student.flash_attention_pytroch import FlashAttentionPyTorch
 
 @triton.jit
 def flash_fwd_kernel(
@@ -122,7 +122,8 @@ class FlashAttentionTriton(Function):
 
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
-        assert Q.is_cuda and K.is_cuda and V.is_cuda, "inputs must be on CUDA"
+        if not Q.is_cuda:
+            return FlashAttentionPyTorch.apply(Q, K, V, is_causal)
 
         Q = Q.contiguous()
         K = K.contiguous()
