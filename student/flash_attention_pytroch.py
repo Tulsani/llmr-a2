@@ -45,8 +45,8 @@ class FlashAttentionPyTorch(Function):
                 K_j = K[:, k_start:k_end, :]
                 V_j = V[:, k_start:k_end, :]
 
-                # Compute attention scores S_i^(j) = Q_i @ K_j^T / sqrt(d)
-                # Shape: (batch, curr_bq, curr_bk)
+                # Compute attention scores 
+                # Shape
                 S_ij = torch.bmm(Q_i.float(), K_j.float().transpose(-1, -2)) * scale
 
                 # Apply causal mask if needed 
@@ -57,30 +57,28 @@ class FlashAttentionPyTorch(Function):
                     mask = k_idx > q_idx  # True where we should mask
                     S_ij = S_ij.masked_fill(mask.unsqueeze(0), -1e6)
 
-                # m_i^(j) = max(m_i^(j-1), rowmax(S_i^(j)))
                 # Shape: (batch, curr_bq)
                 row_max_new = S_ij.max(dim=-1).values  # (batch, curr_bq)
                 m_i_new = torch.maximum(m_i, row_max_new)
 
-                # P_tilde_i^(j) = exp(S_i^(j) - m_i^(j))
-                # Shape: (batch, curr_bq, curr_bk)
+
                 P_tilde = torch.exp(S_ij - m_i_new.unsqueeze(-1))
 
-                # l_i^(j) = exp(m_i^(j-1) - m_i^(j)) * l_i^(j-1) + rowsum(P_tilde_i^(j))
+
                 correction = torch.exp(m_i - m_i_new)  # (batch, curr_bq)
                 l_i_new = correction * l_i + P_tilde.sum(dim=-1)
 
-                # O_i^(j) = diag(exp(m_i^(j-1) - m_i^(j))) @ O_i^(j-1) + P_tilde_i^(j) @ V_j
+
                 O_i = correction.unsqueeze(-1) * O_i + torch.bmm(P_tilde, V_j.float())
 
                 # Update running stats
                 m_i = m_i_new
                 l_i = l_i_new
 
-            # Normalize output: O_i = diag(l_i^(T_k))^{-1} @ O_i^(T_k)
+            # Normalize output
             O_i = O_i / l_i.unsqueeze(-1)
 
-            # Logsumexp: L_i = m_i^(T_k) + log(l_i^(T_k))
+            # Logsumexp
             L_i = m_i + torch.log(l_i)
 
             # Write back
