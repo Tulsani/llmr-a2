@@ -38,7 +38,5 @@ def flash_attention_backward(Q, K, V, O, dO, L, is_causal=False):
 
 
 # Safe
-try:
+if torch.cuda.is_available():
     flash_attention_backward = torch.compile(flash_attention_backward)
-except Exception:
-    flash_attention_backward = flash_attention_backward

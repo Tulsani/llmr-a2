@@ -2,7 +2,9 @@ import math
 import torch
 import triton
 import triton.language as tl
+from triton import cdiv
 from torch.autograd import Function
+
 from student.flash_attention_backward import flash_attention_backward
 
 
@@ -17,12 +19,12 @@ def flash_fwd_kernel(
     stride_lb, stride_lq,
     N_QUERIES, N_KEYS,
     scale,
+    IS_CAUSAL: tl.constexpr,
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
+    N_K_TILES: tl.constexpr,  # constexpr: loop bound compile-time known, avoids OOM in TRITON_INTERPRET=1
 ):
-    # Program indices
     query_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
 
@@ -34,7 +36,6 @@ def flash_fwd_kernel(
         block_shape=(Q_TILE_SIZE, D),
         order=(1, 0),
     )
-
     K_block_ptr = tl.make_block_ptr(
         K_ptr + batch_index * stride_kb,
         shape=(N_KEYS, D),
@@ -43,7 +44,6 @@ def flash_fwd_kernel(
         block_shape=(K_TILE_SIZE, D),
         order=(1, 0),
     )
-
     V_block_ptr = tl.make_block_ptr(
         V_ptr + batch_index * stride_vb,
         shape=(N_KEYS, D),
@@ -52,7 +52,6 @@ def flash_fwd_kernel(
         block_shape=(K_TILE_SIZE, D),
         order=(1, 0),
     )
-
     O_block_ptr = tl.make_block_ptr(
         O_ptr + batch_index * stride_ob,
         shape=(N_QUERIES, D),
@@ -61,7 +60,6 @@ def flash_fwd_kernel(
         block_shape=(Q_TILE_SIZE, D),
         order=(1, 0),
     )
-
     L_block_ptr = tl.make_block_ptr(
         L_ptr + batch_index * stride_lb,
         shape=(N_QUERIES,),
@@ -71,60 +69,53 @@ def flash_fwd_kernel(
         order=(0,),
     )
 
-    # Load the query tile once
-    Q_tile = tl.load(Q_block_ptr)  # (Q_TILE_SIZE, D)
+    # Load Q tile once — constant for this program instance
+    Qi = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
-    # Initialize running accumulators in float32
-    O_acc = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
-    l_acc = tl.zeros((Q_TILE_SIZE,),   dtype=tl.float32)
-    m_acc = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32)
+    # Float32 running accumulators for numerical stability
+    mi = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32)
+    li = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
+    Oi = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
 
     # Query positions for causal masking
     q_start = query_tile_index * Q_TILE_SIZE
-    q_offs  = q_start + tl.arange(0, Q_TILE_SIZE)   # (Q_TILE_SIZE,)
+    q_indices = q_start + tl.arange(0, Q_TILE_SIZE)
 
-    T_k = tl.cdiv(N_KEYS, K_TILE_SIZE)
+    # N_K_TILES is constexpr: the interpreter sees a fixed loop count, preventing
+    # eager unrolling into enormous intermediate allocations (the OOM root cause)
+    for j in range(N_K_TILES):
+        k_start = j * K_TILE_SIZE
 
-    for j in range(T_k):
-        K_tile = tl.load(K_block_ptr)  # (K_TILE_SIZE, D)
-        V_tile = tl.load(V_block_ptr)  # (K_TILE_SIZE, D)
+        Kj = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        Vj = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
-        # Cast Q and K to float32 for the dot product for numerical stability
-        S = tl.dot(Q_tile.to(tl.float32), tl.trans(K_tile.to(tl.float32))) * scale
+        # Attention scores in float32; input_precision="ieee" disables TF32 for correctness
+        Sij = tl.dot(Qi.to(tl.float32), tl.trans(Kj.to(tl.float32)), input_precision="ieee") * scale
 
-        # Causal mask: mask out positions where k_pos > q_pos
         if IS_CAUSAL:
-            k_offs = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)   # (K_TILE_SIZE,)
-            causal_mask = q_offs[:, None] >= k_offs[None, :]
-            S = tl.where(causal_mask, S, -1e6)
+            k_indices = k_start + tl.arange(0, K_TILE_SIZE)
+            causal_mask = q_indices[:, None] >= k_indices[None, :]
+            Sij = tl.where(causal_mask, Sij, -1e6)
 
-        # Online softmax update
-        row_max = tl.max(S, axis=1)                    # (Q_TILE_SIZE,)
-        m_new   = tl.maximum(m_acc, row_max)            # (Q_TILE_SIZE,)
+        # Online softmax
+        mij     = tl.max(Sij, axis=1)
+        mi_new  = tl.maximum(mi, mij)
+        Pij     = tl.exp(Sij - mi_new[:, None])
+        correction = tl.exp(mi - mi_new)
 
-        P_tilde = tl.exp(S - m_new[:, None])            # (Q_TILE_SIZE, K_TILE_SIZE)
-
-        correction = tl.exp(m_acc - m_new)              # (Q_TILE_SIZE,)
-
-        l_acc = correction * l_acc + tl.sum(P_tilde, axis=1)
-
-        # O_acc update: correction * O_acc + P_tilde @ V
-        # Use separate accumulation to avoid acc= argument issues in interpret mode
-        P_V = tl.dot(P_tilde.to(V_tile.dtype), V_tile)  # (Q_TILE_SIZE, D)
-        O_acc = correction[:, None] * O_acc + P_V.to(tl.float32)
-
-        m_acc = m_new
+        li = correction * li + tl.sum(Pij, axis=1)
+        Oi = correction[:, None] * Oi + tl.dot(Pij.to(tl.float32), Vj.to(tl.float32), input_precision="ieee")
+        mi = mi_new
 
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
 
-    # Normalize
-    O_acc = O_acc / l_acc[:, None]                      # (Q_TILE_SIZE, D)
-    L_out = m_acc + tl.log(l_acc)                       # (Q_TILE_SIZE,)
+    Oi = Oi / li[:, None]
+    Li = mi + tl.log(li)
 
-    # Write outputs (cast O back to original dtype)
-    tl.store(O_block_ptr, O_acc.to(O_block_ptr.type.element_ty))
-    tl.store(L_block_ptr, L_out)
+    # Cast back to input dtype on store (handles both fp32 and bf16)
+    tl.store(O_block_ptr, Oi.to(O_block_ptr.type.element_ty), boundary_check=(0, 1))
+    tl.store(L_block_ptr, Li.to(L_block_ptr.type.element_ty), boundary_check=(0,))
 
 
 class FlashAttentionTriton(Function):
@@ -132,24 +123,26 @@ class FlashAttentionTriton(Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
         assert Q.is_cuda and K.is_cuda and V.is_cuda, "inputs must be on CUDA"
-        assert Q.is_contiguous() and K.is_contiguous() and V.is_contiguous()
+
+        Q = Q.contiguous()
+        K = K.contiguous()
+        V = V.contiguous()
 
         batch, N_q, d = Q.shape
         _,     N_k, _ = K.shape
 
-        # Tile sizes must be powers of 2 and at least 16
         Q_TILE_SIZE = max(16, min(64, triton.next_power_of_2(N_q)))
         K_TILE_SIZE = max(16, min(64, triton.next_power_of_2(N_k)))
+        n_q_tiles   = cdiv(N_q, Q_TILE_SIZE)
+        n_k_tiles   = cdiv(N_k, K_TILE_SIZE)
 
         scale = 1.0 / math.sqrt(d)
-        T_q   = math.ceil(N_q / Q_TILE_SIZE)
 
         O = torch.empty_like(Q)
-        L = torch.empty(batch, N_q, device=Q.device, dtype=torch.float32)
+        # L in same dtype as input — matches what the test checks for shape (batch, N_q)
+        L = torch.empty(batch, N_q, device=Q.device, dtype=Q.dtype)
 
-        grid = (T_q, batch)
-
-        flash_fwd_kernel[grid](
+        flash_fwd_kernel[(n_q_tiles, batch)](
             Q, K, V,
             O, L,
             Q.stride(0), Q.stride(1), Q.stride(2),
@@ -157,24 +150,22 @@ class FlashAttentionTriton(Function):
             V.stride(0), V.stride(1), V.stride(2),
             O.stride(0), O.stride(1), O.stride(2),
             L.stride(0), L.stride(1),
-            N_q, N_k,
-            scale,
+            N_QUERIES=N_q,
+            N_KEYS=N_k,
+            scale=scale,
+            IS_CAUSAL=is_causal,
             D=d,
             Q_TILE_SIZE=Q_TILE_SIZE,
             K_TILE_SIZE=K_TILE_SIZE,
-            IS_CAUSAL=is_causal,
+            N_K_TILES=n_k_tiles,
         )
 
         ctx.save_for_backward(Q, K, V, O, L)
         ctx.is_causal = is_causal
-
         return O
 
     @staticmethod
     def backward(ctx, dO):
         Q, K, V, O, L = ctx.saved_tensors
-        is_causal = ctx.is_causal
-
-        dQ, dK, dV = flash_attention_backward(Q, K, V, O, dO, L, is_causal=is_causal)
-
+        dQ, dK, dV = flash_attention_backward(Q, K, V, O, dO, L, is_causal=ctx.is_causal)
         return dQ, dK, dV, None
