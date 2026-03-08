@@ -46,6 +46,8 @@ def parser_args():
 
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
+    parser.add_argument("--compile", action="store_true", default=False)
+
     return parser.parse_args()
 
 
@@ -140,6 +142,8 @@ def main():
 
     print(f"\nBuilding model")
     model = build_model(args)
+    if args.compile:
+        model = torch.compile(model)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
 
     print(f"  Parameters: {n_params:.1f}M\n")
